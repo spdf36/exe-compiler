@@ -14,7 +14,6 @@ def get_random_time():
 
 def get_random_night_time():
     """Generates a random time between 18:30:00 and 22:30:00 (6:30 PM to 10:30 PM)"""
-    # Calculate bounds in seconds to ensure uniform distribution
     start_sec = 18 * 3600 + 30 * 60
     end_sec = 22 * 3600 + 30 * 60
     random_sec = random.randint(start_sec, end_sec)
@@ -26,6 +25,8 @@ def get_random_night_time():
 
 def find_image_file(folder_path, filename):
     """Searches recursively for a file in the given directory (case-insensitive)"""
+    if not os.path.isdir(folder_path):
+        return None
     for root, _, files in os.walk(folder_path):
         for f in files:
             if f.lower() == filename.lower():
@@ -73,16 +74,14 @@ def update_exif_night_time(filepath):
         if filepath.lower().endswith(('.jpg', '.jpeg')):
             exif_dict = piexif.load(filepath)
             
-            # Extract existing date part
             existing_datetime_bytes = exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal)
             if existing_datetime_bytes:
                 existing_datetime_str = existing_datetime_bytes.decode('utf-8')
                 date_part = existing_datetime_str.split(' ')[0]
             else:
-                print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping night update.")
+                print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping.")
                 return
             
-            # Combine existing date with new night time
             new_datetime_str = f"{date_part} {new_time_str}"
             exif_datetime_bytes = new_datetime_str.encode('utf-8')
             
@@ -97,13 +96,12 @@ def update_exif_night_time(filepath):
         elif filepath.lower().endswith('.png'):
             with Image.open(filepath) as img:
                 exif = img.getexif()
-                
-                # Extract existing date part
                 existing_datetime_str = exif.get(36867)
+                
                 if existing_datetime_str:
                     date_part = existing_datetime_str.split(' ')[0]
                 else:
-                    print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping night update.")
+                    print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping.")
                     return
                     
                 new_datetime_str = f"{date_part} {new_time_str}"
@@ -152,11 +150,12 @@ def main():
                     continue
 
                 for filename, date_str in historic_dates.items():
+                    # Safely search inside the specific batch folder
                     img_path = find_image_file(batch_folder, filename)
                     if img_path:
                         update_exif_date(img_path, date_str)
                     else:
-                        print(f"  [!] File not found: {filename}")
+                        print(f"  [!] File not found: {filename} in {item}")
 
     print("\n=============================================")
     print("      Day Time Processing Complete!          ")
@@ -170,7 +169,6 @@ def main():
         
         if os.path.isfile(csv_path):
             print("\nProcessing night time pictures from CSV...")
-            # Using utf-8-sig to automatically handle any Excel BOM formatting
             with open(csv_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.reader(f)
                 for row in reader:
@@ -181,29 +179,30 @@ def main():
                     if not rel_path: 
                         continue
                     
-                    # Normalize slashes for cross-platform and split the path
+                    # Normalize slashes and split
                     rel_path_clean = rel_path.replace('\\', '/')
                     parts = rel_path_clean.split('/')
                     filename = parts[-1]
                     
-                    # Try to reconstruct the exact path based on the user's base_dir
-                    base_dir_name = os.path.basename(os.path.normpath(base_dir))
+                    # Extract the P-folder (e.g., P00013) from the CSV path
+                    p_folder = next((part for part in parts if part.upper().startswith('P0') and len(part) >= 4), None)
                     
-                    # Strategy 1: If CSV path starts with the base directory name (e.g., 'Batch_2')
-                    if len(parts) > 1 and parts[0] == base_dir_name:
-                        img_path = os.path.join(base_dir, *parts[1:])
-                    # Strategy 2: Assume the CSV path continues straight from the base_dir parent
-                    else:
-                        img_path = os.path.join(os.path.dirname(base_dir), *parts)
-                        
-                    # Strategy 3: Fallback - if direct path mapping fails, search for the filename
-                    if not os.path.isfile(img_path):
+                    img_path = None
+                    
+                    # If we found the P-folder in the CSV path, search ONLY inside that specific folder
+                    if p_folder:
+                        specific_batch_folder = os.path.join(base_dir, p_folder)
+                        img_path = find_image_file(specific_batch_folder, filename)
+                    
+                    # If all else fails, try a global search in the base dir
+                    if not img_path:
                         img_path = find_image_file(base_dir, filename)
-                        
+
+                    # Update if found
                     if img_path and os.path.isfile(img_path):
                         update_exif_night_time(img_path)
                     else:
-                        print(f"  [!] Night file not found for CSV entry: {rel_path}")
+                        print(f"  [!] Night file not found in directory: {rel_path}")
         else:
             print(f"\n[Error] The CSV file '{csv_path}' does not exist.")
 
