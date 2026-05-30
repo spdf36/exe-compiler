@@ -34,18 +34,25 @@ def find_image_file(folder_path, filename):
     return None
 
 def update_exif_date(filepath, new_date_str):
-    """Updates the Date Taken (DateTimeOriginal) EXIF metadata of the image"""
-    date_part = new_date_str.split('T')[0].replace('-', ':')
-    time_part = get_random_time()
-    exif_datetime_str = f"{date_part} {time_part}"
-    exif_datetime_bytes = exif_datetime_str.encode('utf-8')
-
+    """Updates the EXIF metadata ONLY if it doesn't already exist."""
     try:
+        # Check and process JPG/JPEG
         if filepath.lower().endswith(('.jpg', '.jpeg')):
             try:
                 exif_dict = piexif.load(filepath)
+                # Check if EXIF DateTimeOriginal already exists
+                if exif_dict.get("Exif") and exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal):
+                    print(f"  [-] Skipped (EXIF already intact): {os.path.basename(filepath)}")
+                    return
             except Exception:
+                # If no EXIF data exists at all, prepare a blank dictionary structure
                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}}
+
+            # If we made it here, it's missing EXIF data. Let's create it.
+            date_part = new_date_str.split('T')[0].replace('-', ':')
+            time_part = get_random_time()
+            exif_datetime_str = f"{date_part} {time_part}"
+            exif_datetime_bytes = exif_datetime_str.encode('utf-8')
 
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_datetime_bytes
             exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_datetime_bytes
@@ -53,21 +60,34 @@ def update_exif_date(filepath, new_date_str):
 
             exif_bytes = piexif.dump(exif_dict)
             piexif.insert(exif_bytes, filepath)
+            print(f"  [+] Day Time Updated: {os.path.basename(filepath)} -> {exif_datetime_str}")
             
+        # Check and process PNG
         elif filepath.lower().endswith('.png'):
             with Image.open(filepath) as img:
                 exif = img.getexif()
+                
+                # 36867 is the EXIF code for DateTimeOriginal
+                if exif and exif.get(36867):
+                    print(f"  [-] Skipped (EXIF already intact): {os.path.basename(filepath)}")
+                    return
+                
+                # If missing, create it
+                date_part = new_date_str.split('T')[0].replace('-', ':')
+                time_part = get_random_time()
+                exif_datetime_str = f"{date_part} {time_part}"
+                
                 exif[36867] = exif_datetime_str
                 exif[36868] = exif_datetime_str
                 exif[306] = exif_datetime_str
                 img.save(filepath, exif=exif)
+                print(f"  [+] Day Time Updated: {os.path.basename(filepath)} -> {exif_datetime_str}")
                 
-        print(f"  [+] Day Time Updated: {os.path.basename(filepath)} -> {exif_datetime_str}")
     except Exception as e:
-        print(f"  [!] Failed to update {os.path.basename(filepath)}: {e}")
+        print(f"  [!] Failed to check/update {os.path.basename(filepath)}: {e}")
 
 def update_exif_night_time(filepath):
-    """Reads existing EXIF date, keeps it, and only randomizes the time to night hours."""
+    """Reads existing EXIF date, keeps it, and randomizes the time to night hours."""
     new_time_str = get_random_night_time()
     
     try:
@@ -79,7 +99,7 @@ def update_exif_night_time(filepath):
                 existing_datetime_str = existing_datetime_bytes.decode('utf-8')
                 date_part = existing_datetime_str.split(' ')[0]
             else:
-                print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping.")
+                print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)} to map night time. Skipping.")
                 return
             
             new_datetime_str = f"{date_part} {new_time_str}"
@@ -101,7 +121,7 @@ def update_exif_night_time(filepath):
                 if existing_datetime_str:
                     date_part = existing_datetime_str.split(' ')[0]
                 else:
-                    print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)}. Skipping.")
+                    print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)} to map night time. Skipping.")
                     return
                     
                 new_datetime_str = f"{date_part} {new_time_str}"
@@ -189,12 +209,12 @@ def main():
                     
                     img_path = None
                     
-                    # If we found the P-folder in the CSV path, search ONLY inside that specific folder
+                    # Search ONLY inside that specific folder to prevent wrong file matching
                     if p_folder:
                         specific_batch_folder = os.path.join(base_dir, p_folder)
                         img_path = find_image_file(specific_batch_folder, filename)
                     
-                    # If all else fails, try a global search in the base dir
+                    # Fallback global search
                     if not img_path:
                         img_path = find_image_file(base_dir, filename)
 
