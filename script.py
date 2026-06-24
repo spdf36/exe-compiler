@@ -1,238 +1,138 @@
 import os
-import json
-import random
-import piexif
-import csv
-from PIL import Image
+import shutil
+import subprocess
+from pathlib import Path
+from tqdm import tqdm
 
-def get_random_time():
-    """Generates a random time between 09:00:00 and 17:59:59"""
-    h = random.randint(9, 17)
-    m = random.randint(0, 59)
-    s = random.randint(0, 59)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+# Define the flexible video extensions you want to target
+SUPPORTED_EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v'}
 
-def get_random_night_time():
-    """Generates a random time between 18:30:00 and 22:30:00 (6:30 PM to 10:30 PM)"""
-    start_sec = 18 * 3600 + 30 * 60
-    end_sec = 22 * 3600 + 30 * 60
-    random_sec = random.randint(start_sec, end_sec)
+def check_dependencies():
+    """Ensure ffmpeg and exiftool are installed and accessible."""
+    missing = []
+    if not shutil.which('ffmpeg'):
+        missing.append("FFmpeg")
+    if not shutil.which('exiftool'):
+        missing.append("ExifTool")
     
-    h = random_sec // 3600
-    m = (random_sec % 3600) // 60
-    s = random_sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    if missing:
+        print(f"❌ Error: Missing dependencies: {', '.join(missing)}")
+        print("Please install them and ensure they are added to your system PATH.")
+        exit(1)
 
-def find_image_file(folder_path, filename):
-    """Searches recursively for a file in the given directory (case-insensitive)"""
-    if not os.path.isdir(folder_path):
-        return None
-    for root, _, files in os.walk(folder_path):
-        for f in files:
-            if f.lower() == filename.lower():
-                return os.path.join(root, f)
-    return None
-
-def update_exif_date(filepath, new_date_str):
-    """Updates the EXIF metadata ONLY if it doesn't already exist."""
-    try:
-        # Check and process JPG/JPEG
-        if filepath.lower().endswith(('.jpg', '.jpeg')):
-            try:
-                exif_dict = piexif.load(filepath)
-                # Check if EXIF DateTimeOriginal already exists
-                if exif_dict.get("Exif") and exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal):
-                    print(f"  [-] Skipped (EXIF already intact): {os.path.basename(filepath)}")
-                    return
-            except Exception:
-                # If no EXIF data exists at all, prepare a blank dictionary structure
-                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}}
-
-            # If we made it here, it's missing EXIF data. Let's create it.
-            date_part = new_date_str.split('T')[0].replace('-', ':')
-            time_part = get_random_time()
-            exif_datetime_str = f"{date_part} {time_part}"
-            exif_datetime_bytes = exif_datetime_str.encode('utf-8')
-
-            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_datetime_bytes
-            exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_datetime_bytes
-            exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_datetime_bytes
-
-            exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, filepath)
-            print(f"  [+] Day Time Updated: {os.path.basename(filepath)} -> {exif_datetime_str}")
-            
-        # Check and process PNG
-        elif filepath.lower().endswith('.png'):
-            with Image.open(filepath) as img:
-                exif = img.getexif()
-                
-                # 36867 is the EXIF code for DateTimeOriginal
-                if exif and exif.get(36867):
-                    print(f"  [-] Skipped (EXIF already intact): {os.path.basename(filepath)}")
-                    return
-                
-                # If missing, create it
-                date_part = new_date_str.split('T')[0].replace('-', ':')
-                time_part = get_random_time()
-                exif_datetime_str = f"{date_part} {time_part}"
-                
-                exif[36867] = exif_datetime_str
-                exif[36868] = exif_datetime_str
-                exif[306] = exif_datetime_str
-                img.save(filepath, exif=exif)
-                print(f"  [+] Day Time Updated: {os.path.basename(filepath)} -> {exif_datetime_str}")
-                
-    except Exception as e:
-        print(f"  [!] Failed to check/update {os.path.basename(filepath)}: {e}")
-
-def update_exif_night_time(filepath):
-    """Reads existing EXIF date, keeps it, and randomizes the time to night hours."""
-    new_time_str = get_random_night_time()
+def process_video(file_path):
+    """Mutes, converts (if needed), and removes metadata from a single video."""
+    file_path = Path(file_path)
+    original_ext = file_path.suffix.lower()
     
+    # Define paths
+    new_file_path = file_path.with_suffix('.mp4')
+    # Use a temporary file to avoid in-place read/write corruption with ffmpeg
+    temp_output = file_path.with_name(f".temp_{file_path.stem}.mp4")
+
     try:
-        if filepath.lower().endswith(('.jpg', '.jpeg')):
-            exif_dict = piexif.load(filepath)
-            
-            existing_datetime_bytes = exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal)
-            if existing_datetime_bytes:
-                existing_datetime_str = existing_datetime_bytes.decode('utf-8')
-                date_part = existing_datetime_str.split(' ')[0]
-            else:
-                print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)} to map night time. Skipping.")
-                return
-            
-            new_datetime_str = f"{date_part} {new_time_str}"
-            exif_datetime_bytes = new_datetime_str.encode('utf-8')
-            
-            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_datetime_bytes
-            exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_datetime_bytes
-            exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_datetime_bytes
-            
-            exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, filepath)
-            print(f"  [+] Night Time Updated: {os.path.basename(filepath)} -> {new_datetime_str}")
-            
-        elif filepath.lower().endswith('.png'):
-            with Image.open(filepath) as img:
-                exif = img.getexif()
-                existing_datetime_str = exif.get(36867)
-                
-                if existing_datetime_str:
-                    date_part = existing_datetime_str.split(' ')[0]
-                else:
-                    print(f"  [!] No existing EXIF date found in {os.path.basename(filepath)} to map night time. Skipping.")
-                    return
-                    
-                new_datetime_str = f"{date_part} {new_time_str}"
-                exif[36867] = new_datetime_str
-                exif[36868] = new_datetime_str
-                exif[306] = new_datetime_str
-                img.save(filepath, exif=exif)
-                print(f"  [+] Night Time Updated: {os.path.basename(filepath)} -> {new_datetime_str}")
-                
+        # Step 1 & 2: Mute (-an) and Convert to mp4 (-c:v copy for blazing speed without re-encoding)
+        ffmpeg_cmd = [
+            'ffmpeg', 
+            '-y',                   # Overwrite output files without asking
+            '-i', str(file_path),   # Input file
+            '-c:v', 'copy',         # Copy the video codec directly (no quality loss, very fast)
+            '-an',                  # Remove audio
+            str(temp_output)        # Output temp file
+        ]
+        
+        # Run ffmpeg, suppressing standard output/errors to keep the terminal clean
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Step 3: Remove Metadata using ExifTool
+        exiftool_cmd = [
+            'exiftool', 
+            '-all=',                # Strip all metadata
+            '-overwrite_original',  # Overwrite in place (prevents creating *_original backup files)
+            str(temp_output)
+        ]
+        
+        subprocess.run(exiftool_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Step 4: Cleanup and replace original
+        if original_ext != '.mp4':
+            # If it was a .mov (or other), delete the original file safely
+            file_path.unlink()
+        elif file_path.exists() and file_path != temp_output:
+            # If it was already an .mp4, delete the original so we can replace it
+            file_path.unlink()
+
+        # Rename the processed temporary file to the final .mp4 name
+        temp_output.rename(new_file_path)
+        return True, ""
+
+    except subprocess.CalledProcessError as e:
+        # If anything fails, clean up the temp file to prevent clutter
+        if temp_output.exists():
+            temp_output.unlink()
+        return False, f"Failed to process {file_path.name}: {e}"
     except Exception as e:
-        print(f"  [!] Failed to update night time for {os.path.basename(filepath)}: {e}")
+        if temp_output.exists():
+            temp_output.unlink()
+        return False, str(e)
 
 def main():
-    print("=============================================")
-    print("      Image EXIF Date Randomizer Tool        ")
-    print("=============================================\n")
+    print("🎬 Video Processing Tool (Mute, Convert to MP4, Strip Metadata)")
+    print("-" * 60)
     
-    # --- PHASE 1: DAYTIME PROCESSING ---
-    base_dir = input("Enter the path to the main input folder: ").strip().strip('"\'')
+    check_dependencies()
+
+    # Get input folder from user
+    input_folder = input("📂 Enter the folder path to process: ").strip()
     
-    if not os.path.isdir(base_dir):
-        print(f"\n[Error] The directory '{base_dir}' does not exist.")
-        input("\nPress Enter to close...")
+    # Strip quotes if the user dragged and dropped the folder into the terminal
+    if input_folder.startswith('"') and input_folder.endswith('"'):
+        input_folder = input_folder[1:-1]
+    elif input_folder.startswith("'") and input_folder.endswith("'"):
+        input_folder = input_folder[1:-1]
+
+    folder_path = Path(input_folder)
+
+    if not folder_path.is_dir():
+        print("❌ Error: The provided path is not a valid directory.")
         return
 
-    for item in os.listdir(base_dir):
-        batch_folder = os.path.join(base_dir, item)
-        
-        if os.path.isdir(batch_folder):
-            metadata_path = os.path.join(batch_folder, "metadata.json")
-            
-            if os.path.isfile(metadata_path):
-                print(f"\nProcessing batch: {item}")
-                
-                with open(metadata_path, 'r', encoding='utf-8') as f:
-                    try:
-                        metadata = json.load(f)
-                    except json.JSONDecodeError:
-                        print(f"  [!] Failed to parse metadata.json in {item}")
-                        continue
-                
-                historic_dates = metadata.get("historic_capture_dates", {})
-                
-                if not historic_dates:
-                    print("  [-] No 'historic_capture_dates' found in metadata.json. Skipping.")
-                    continue
+    # Find all supported video files recursively
+    print("\n🔍 Scanning folder for video files...")
+    video_files = []
+    for ext in SUPPORTED_EXTENSIONS:
+        video_files.extend(folder_path.rglob(f"*{ext}"))
+        video_files.extend(folder_path.rglob(f"*{ext.upper()}")) # Catch uppercase extensions
 
-                for filename, date_str in historic_dates.items():
-                    # Safely search inside the specific batch folder
-                    img_path = find_image_file(batch_folder, filename)
-                    if img_path:
-                        update_exif_date(img_path, date_str)
-                    else:
-                        print(f"  [!] File not found: {filename} in {item}")
+    # Remove duplicates just in case
+    video_files = list(set(video_files))
 
-    print("\n=============================================")
-    print("      Day Time Processing Complete!          ")
-    print("=============================================\n")
+    if not video_files:
+        print("⚠️ No supported video files found in the specified folder.")
+        return
 
-    # --- PHASE 2: NIGHTTIME PROCESSING ---
-    process_night = input("Do you have a CSV file for night time pictures? (y/n): ").strip().lower()
-    
-    if process_night == 'y':
-        csv_path = input("Enter the path to the CSV file: ").strip().strip('"\'')
-        
-        if os.path.isfile(csv_path):
-            print("\nProcessing night time pictures from CSV...")
-            with open(csv_path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if not row: 
-                        continue
-                    
-                    rel_path = row[0].strip()
-                    if not rel_path: 
-                        continue
-                    
-                    # Normalize slashes and split
-                    rel_path_clean = rel_path.replace('\\', '/')
-                    parts = rel_path_clean.split('/')
-                    filename = parts[-1]
-                    
-                    # Extract the P-folder (e.g., P00013) from the CSV path
-                    p_folder = next((part for part in parts if part.upper().startswith('P0') and len(part) >= 4), None)
-                    
-                    img_path = None
-                    
-                    # Search ONLY inside that specific folder to prevent wrong file matching
-                    if p_folder:
-                        specific_batch_folder = os.path.join(base_dir, p_folder)
-                        img_path = find_image_file(specific_batch_folder, filename)
-                    
-                    # Fallback global search
-                    if not img_path:
-                        img_path = find_image_file(base_dir, filename)
+    print(f"✅ Found {len(video_files)} video file(s). Starting processing...\n")
 
-                    # Update if found
-                    if img_path and os.path.isfile(img_path):
-                        update_exif_night_time(img_path)
-                    else:
-                        print(f"  [!] Night file not found in directory: {rel_path}")
+    # Process files with tqdm progress bar
+    successful = 0
+    errors = []
+
+    for video_file in tqdm(video_files, desc="Processing Videos", unit="file"):
+        success, error_msg = process_video(video_file)
+        if success:
+            successful += 1
         else:
-            print(f"\n[Error] The CSV file '{csv_path}' does not exist.")
+            errors.append(error_msg)
 
-    print("\n=============================================")
-    print("Process completely finished!")
-    input("Press Enter to close...")
+    # Final Report
+    print("\n" + "=" * 60)
+    print("🎉 Processing Complete!")
+    print(f"✅ Successfully processed: {successful}/{len(video_files)} files.")
+    
+    if errors:
+        print(f"❌ Errors encountered ({len(errors)}):")
+        for err in errors:
+            print(f"   - {err}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
-        input("\nPress Enter to close...")
+    main()
