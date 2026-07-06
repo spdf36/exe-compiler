@@ -1,178 +1,196 @@
-import pandas as pd
+import sys
 import os
 import shutil
-import cv2
-from datetime import datetime
+import subprocess
+import json
 from pathlib import Path
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def get_video_metadata(filepath):
-    """Extracts duration, FPS, and resolution from a video file."""
-    cap = cv2.VideoCapture(str(filepath))
-    if not cap.isOpened():
-        return None, None, None
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    # Handle potential division by zero
-    duration_sec = round(frame_count / fps, 2) if fps and fps > 0 else 0.0
-    resolution = f"{width}x{height}"
-    
-    cap.release()
-    return duration_sec, round(fps, 2), resolution
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
+                             QFileDialog, QLabel)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-def process_video_dataset(input_xlsx, source_folder, output_xlsx, output_base_folder):
-    print("\n[1/4] Loading Excel file...")
-    try:
-        df = pd.read_excel(input_xlsx)
-    except Exception as e:
-        print(f"Error reading Excel file: {e}")
-        return
+# --- CORE LOGIC HELPER ---
+def get_bin_path(exe_name):
+    """Finds ffmpeg/ffprobe in a local 'bin' folder first, then system PATH."""
+    exe_with_ext = f"{exe_name}.exe" if os.name == 'nt' else exe_name
     
-    # Clean up column names just in case there are trailing spaces
-    df.columns = df.columns.str.strip()
-    
-    print("[2/4] Scanning source directory for video files (this might take a moment)...")
-    source_path = Path(source_folder)
-    # Dictionary to quickly find the full path of a file by its name
-    file_map = {f.name: f for f in source_path.rglob('*') if f.is_file()}
-    print(f"      Found {len(file_map)} total files in source directories.")
-    
-    # Create the batch directory with today's date
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    batch_folder_name = f"batch_{today_str}"
-    batch_dir = Path(output_base_folder) / batch_folder_name
-    
-    new_paths = []
-    
-    print(f"[3/4] Processing files, extracting metadata, and organizing folders...")
-    
-    # Use standard loops with print updates for a better CLI experience
-    total_rows = len(df)
-    for index, row in df.iterrows():
-        file_name = str(row.get("Video File Name")).strip()
+    # Check if running as compiled PyInstaller exe
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys.executable).parent
+    else:
+        base_dir = Path(__file__).parent
         
-        # Display progress
-        sys.stdout.write(f"\r      Processing {index + 1}/{total_rows}: {file_name[:30]}...")
-        sys.stdout.flush()
+    local_bin = base_dir / "bin" / exe_with_ext
+    if local_bin.exists():
+        return str(local_bin)
         
-        # Replace NaNs or empty values with "Unknown" to avoid folder creation errors
-        age_group = str(row.get("Age Group", "Unknown_Age")).strip() or "Unknown_Age"
-        gender = str(row.get("Gender", "Unknown_Gender")).strip() or "Unknown_Gender"
-        skin_tone = str(row.get("Skin Tone", "Unknown_Skin_Tone")).strip() or "Unknown_Skin_Tone"
-        participant_id = str(row.get("Global Participant ID", "Unknown_ID")).strip() or "Unknown_ID"
+    sys_path = shutil.which(exe_name)
+    if sys_path:
+        return sys_path
         
-        # Check if the file exists in our scanned files
-        if file_name in file_map:
-            original_file_path = file_map[file_name]
-            
-            # Construct the new folder structure
-            target_dir = batch_dir / age_group / gender / skin_tone / participant_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Construct the target file path
-            target_file_path = target_dir / file_name
-            
-            try:
-                # Move the file
-                shutil.move(str(original_file_path), str(target_file_path))
-                
-                # Extract Metadata from the video
-                duration, fps, resolution = get_video_metadata(target_file_path)
-                
-                # Update the DataFrame with the extracted data
-                df.at[index, "Video Duration (sec)"] = duration
-                df.at[index, "FPS"] = fps
-                df.at[index, "Video Resolution"] = resolution
-                
-                # Record the relative path starting from batch_<todays_date>
-                relative_path = Path(batch_folder_name) / age_group / gender / skin_tone / participant_id / file_name
-                new_paths.append(str(relative_path))
-            except Exception as e:
-                new_paths.append(f"Error Processing: {e}")
-            
-        else:
-            new_paths.append("File Not Found in Source")
-            
-    print("\n[4/4] Sorting data and saving to new Excel file...")
-    # Add the new path column to the end of the DataFrame
-    df["File Path"] = new_paths
-    
-    # Sort by Global Participant ID
-    if "Global Participant ID" in df.columns:
-        df.sort_values(by="Global Participant ID", inplace=True)
-    
-    # Save to the new Output Excel file
-    try:
-        df.to_excel(output_xlsx, index=False, engine='openpyxl')
-        print(f"\nSUCCESS! Process complete. Output saved to: {output_xlsx}")
-    except Exception as e:
-        print(f"\nERROR: Could not save output Excel file. Is it open in another program? Details: {e}")
+    raise FileNotFoundError(f"{exe_name} missing! Please place it in the 'bin/' folder.")
 
-# ==========================================
-# Terminal/CLI Interactive Execution Setup
-# ==========================================
+# [Keep your existing functions here: detect_qsv_support, default_worker_count, 
+# find_mov_files, ffprobe_info, build_cmd, convert_file, verify_mp4]
+# *Make sure to update the subprocess calls to use get_bin_path("ffmpeg") 
+# instead of hardcoding "ffmpeg"*
+
+
+# --- THREAD FOR BACKGROUND PROCESSING ---
+class ConversionWorker(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool)
+
+    def __init__(self, root_path):
+        super().__init__()
+        self.root_path = Path(root_path)
+
+    def log(self, text):
+        self.log_signal.emit(text)
+
+    def run(self):
+        try:
+            self.log("--- MOV to MP4 In-Place Converter ---")
+            
+            # Note: Update detect_qsv_support in your original code to use get_bin_path
+            use_gpu = False # detect_qsv_support() 
+            self.log("\nIntel Quick Sync: " + ("Available" if use_gpu else "Not available (Using CPU)"))
+
+            workers = default_worker_count(use_gpu)
+            cores = os.cpu_count() or 4
+            threads_per_job = max(1, cores // workers)
+
+            mov_files = find_mov_files(self.root_path)
+            if not mov_files:
+                self.log(f"No .mov files found under {self.root_path}")
+                self.finished_signal.emit(True)
+                return
+
+            self.log(f"Found {len(mov_files)} .mov file(s). Converting with {workers} worker(s)...\n")
+
+            results = []
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(convert_file, f, use_gpu, threads_per_job): f
+                    for f in mov_files
+                }
+                for future in as_completed(futures):
+                    src, dst, success, msg = future.result()
+                    status = "OK  " if success else "FAIL"
+                    self.log(f"[{status}] {src.name} :: {msg}")
+                    
+                    if success:
+                        try:
+                            src.unlink()
+                            self.log(f"      Deleted original: {src.name}")
+                        except OSError as e:
+                            self.log(f"      Warning: could not delete {src}: {e}")
+                    
+                    results.append((src, dst, success, msg))
+
+            succeeded = sum(1 for _, _, ok, _ in results if ok)
+            failed = len(results) - succeeded
+            self.log(f"\nDone. {succeeded} successful, {failed} failed.")
+            
+            self.finished_signal.emit(failed == 0)
+
+        except Exception as e:
+            self.log(f"\nCRITICAL ERROR: {str(e)}")
+            self.finished_signal.emit(False)
+
+
+# --- GUI WINDOW ---
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MOV to MP4 Converter")
+        self.resize(700, 500)
+        self.setAcceptDrops(True) # Enable window-level drops
+
+        # Layout setup
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+
+        # Instructions
+        self.label = QLabel("Drag & Drop a folder below, or paste the path:")
+        layout.addWidget(self.label)
+
+        # Input Row
+        input_layout = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("e.g. C:/Users/Name/Videos")
+        input_layout.addWidget(self.path_input)
+
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self.browse_folder)
+        input_layout.addWidget(self.browse_btn)
+        layout.addLayout(input_layout)
+
+        # Action Button
+        self.start_btn = QPushButton("Start Conversion")
+        self.start_btn.setMinimumHeight(40)
+        self.start_btn.clicked.connect(self.start_conversion)
+        layout.addWidget(self.start_btn)
+
+        # Log Output
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+
+        self.worker = None
+
+    # Drag and Drop Event Handlers
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if Path(url.toLocalFile()).is_dir():
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        url = event.mimeData().urls()[0]
+        self.path_input.setText(url.toLocalFile())
+
+    # Button Handlers
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder:
+            self.path_input.setText(folder)
+
+    def start_conversion(self):
+        folder_path = self.path_input.text().strip()
+        if not folder_path or not Path(folder_path).is_dir():
+            self.log_output.append("Error: Please provide a valid directory path.")
+            return
+
+        # Lock UI
+        self.start_btn.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.path_input.setEnabled(False)
+        self.log_output.clear()
+
+        # Start background thread
+        self.worker = ConversionWorker(folder_path)
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.finished_signal.connect(self.conversion_finished)
+        self.worker.start()
+
+    def append_log(self, text):
+        self.log_output.append(text)
+        # Auto-scroll to bottom
+        scrollbar = self.log_output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def conversion_finished(self, success):
+        self.start_btn.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.path_input.setEnabled(True)
+        self.worker = None
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print(" " * 15 + "Video Dataset Processor Tool")
-    print("=" * 60)
-    print("You can type the folder/file paths or drag-and-drop them here.\n")
-
-    # 1. Get Input Excel Path
-    while True:
-        input_xlsx = input("1. Enter the path to the INPUT Excel file (.xlsx): ").strip()
-        # Clean up quotes if user dragged-and-dropped the file into the terminal
-        input_xlsx = input_xlsx.strip('"').strip("'") 
-        
-        if os.path.isfile(input_xlsx) and input_xlsx.lower().endswith('.xlsx'):
-            break
-        print("   [!] Error: File not found or not an .xlsx file. Please try again.\n")
-
-    # 2. Get Source Video Folder
-    while True:
-        source_folder = input("2. Enter the path to the SOURCE video folder: ").strip()
-        source_folder = source_folder.strip('"').strip("'")
-        
-        if os.path.isdir(source_folder):
-            break
-        print("   [!] Error: Directory not found. Please try again.\n")
-
-    # 3. Get Output Base Folder
-    while True:
-        output_base_folder = input("3. Enter the target folder where files will be MOVED (batch folder will be created here): ").strip()
-        output_base_folder = output_base_folder.strip('"').strip("'")
-        
-        if os.path.isdir(output_base_folder):
-            break
-        
-        # Give user option to create the directory if it doesn't exist
-        create_dir = input(f"   Directory '{output_base_folder}' does not exist. Create it? (y/n): ").strip().lower()
-        if create_dir == 'y':
-            try:
-                os.makedirs(output_base_folder, exist_ok=True)
-                break
-            except Exception as e:
-                print(f"   [!] Error creating directory: {e}\n")
-        else:
-            print("   Please provide a valid directory.\n")
-
-    # 4. Get Output Excel File Name
-    output_xlsx = input("4. Enter the desired name/path for the OUTPUT Excel file (e.g., output.xlsx): ").strip()
-    output_xlsx = output_xlsx.strip('"').strip("'")
-    if not output_xlsx.lower().endswith('.xlsx'):
-        output_xlsx += '.xlsx'
-
-    # Run the main processor
-    try:
-        process_video_dataset(input_xlsx, source_folder, output_xlsx, output_base_folder)
-    except KeyboardInterrupt:
-        print("\n\nProcess cancelled by user.")
-    except Exception as e:
-        print(f"\n\nAn unexpected error occurred: {e}")
-
-    print("=" * 60)
-    # Crucial for .exe files: Prevents the terminal window from closing instantly upon completion
-    input("Press Enter to exit the program...")
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
