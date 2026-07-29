@@ -30,12 +30,85 @@ def get_bin_path(exe_name):
     if sys_path:
         return sys_path
         
-    raise FileNotFoundError(f"{exe_name} missing! Please place it in the 'bin/' folder.")
+    raise FileNotFoundError(f"{exe_name} missing! Please place it in the 'bin/' or system PATH.")
 
-# [Keep your existing functions here: detect_qsv_support, default_worker_count, 
-# find_mov_files, ffprobe_info, build_cmd, convert_file, verify_mp4]
-# *Make sure to update the subprocess calls to use get_bin_path("ffmpeg") 
-# instead of hardcoding "ffmpeg"*
+def detect_qsv_support():
+    """Detects if Intel Quick Sync Video (QSV) is supported by the FFmpeg build."""
+    try:
+        cmd = [get_bin_path("ffmpeg"), "-encoders"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return "h264_qsv" in result.stdout
+    except Exception:
+        return False
+
+def default_worker_count(use_gpu):
+    """Determines how many files to process concurrently."""
+    if use_gpu:
+        return 1  # Hardware encoders usually perform better processing 1 file at a time
+    cores = os.cpu_count() or 4
+    return max(1, cores // 2)
+
+def find_mov_files(root_path):
+    """Recursively finds all .mov files in the given directory."""
+    return list(Path(root_path).rglob("*.mov")) + list(Path(root_path).rglob("*.MOV"))
+
+def verify_mp4(filepath):
+    """Verifies the output file exists and is not empty."""
+    return filepath.exists() and filepath.stat().st_size > 0
+
+def build_cmd(src, dst, use_gpu, threads_per_job):
+    """Builds the FFmpeg command list, including rotation fixes."""
+    cmd = [
+        get_bin_path("ffmpeg"),
+        "-y",                 # Overwrite output files
+        "-noautorotate",      # FIX: Prevents physical frame rotation
+        "-i", str(src),       # Input file
+        "-map_metadata", "0", # FIX: Copies original rotation metadata exactly
+    ]
+    
+    # Video Codec
+    if use_gpu:
+        cmd.extend(["-c:v", "h264_qsv", "-preset", "medium"])
+    else:
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+        
+    # Audio Codec & Threads
+    cmd.extend([
+        "-c:a", "aac", 
+        "-b:a", "192k",
+        "-threads", str(threads_per_job),
+        str(dst)
+    ])
+    
+    return cmd
+
+def convert_file(src, use_gpu, threads_per_job):
+    """Executes the FFmpeg conversion for a single file."""
+    dst = src.with_suffix('.mp4')
+    cmd = build_cmd(src, dst, use_gpu, threads_per_job)
+    
+    try:
+        # Hide console window on Windows
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+        
+        if result.returncode == 0 and verify_mp4(dst):
+            return (src, dst, True, "Successfully converted.")
+        else:
+            # Clean up corrupted/failed partial output
+            if dst.exists():
+                dst.unlink()
+            
+            # Extract last line of error for the log
+            err_msg = result.stderr.strip().split('\n')[-1] if result.stderr else "Unknown FFmpeg error"
+            return (src, dst, False, err_msg)
+            
+    except Exception as e:
+        return (src, dst, False, str(e))
 
 
 # --- THREAD FOR BACKGROUND PROCESSING ---
@@ -54,9 +127,8 @@ class ConversionWorker(QThread):
         try:
             self.log("--- MOV to MP4 In-Place Converter ---")
             
-            # Note: Update detect_qsv_support in your original code to use get_bin_path
-            use_gpu = False # detect_qsv_support() 
-            self.log("\nIntel Quick Sync: " + ("Available" if use_gpu else "Not available (Using CPU)"))
+            use_gpu = detect_qsv_support() 
+            self.log("Intel Quick Sync: " + ("Available" if use_gpu else "Not available (Using CPU)"))
 
             workers = default_worker_count(use_gpu)
             cores = os.cpu_count() or 4
@@ -86,7 +158,7 @@ class ConversionWorker(QThread):
                             src.unlink()
                             self.log(f"      Deleted original: {src.name}")
                         except OSError as e:
-                            self.log(f"      Warning: could not delete {src}: {e}")
+                            self.log(f"      Warning: could not delete {src.name}: {e}")
                     
                     results.append((src, dst, success, msg))
 
