@@ -88,7 +88,7 @@ def build_cmd(src, dst, use_gpu, threads_per_job):
         "-y",                 
         "-noautorotate",      
         "-i", str(src),       
-        "-map_metadata", "0", 
+        "-map_metadata", "-1", # Strips all global metadata
     ]
     
     if use_gpu:
@@ -97,8 +97,7 @@ def build_cmd(src, dst, use_gpu, threads_per_job):
         cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
         
     cmd.extend([
-        "-c:a", "aac", 
-        "-b:a", "192k",
+        "-an", # Completely removes the audio track (mutes the video)
         "-threads", str(threads_per_job),
         str(dst)
     ])
