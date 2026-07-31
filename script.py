@@ -101,8 +101,8 @@ def process_videos_parallel(input_dir, output_dir, max_workers, mode):
 
 if __name__ == "__main__":
     # --- SETUP YOUR PATHS HERE ---
-    INPUT_FOLDER = input("Enter the input folder path: ").strip('"\'')
-    OUTPUT_FOLDER = input("Enter the output folder path: ").strip('"\'')
+    INPUT_FOLDER = input("Enter the input folder path : ").strip('"\'')
+    OUTPUT_FOLDER = input("Enter the output folder path : ").strip('"\'')
     
     # --- CHOOSE YOUR SPEED MODE HERE ---
     ENCODING_MODE = 'cpu_ultrafast' 
