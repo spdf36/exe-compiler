@@ -1,283 +1,111 @@
-import sys
 import os
-import shutil
 import subprocess
-import time
+import threading
+import concurrent.futures
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLineEdit, QPushButton, QTextEdit, 
-                             QFileDialog, QLabel)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+print_lock = threading.Lock()
 
-# --- CORE LOGIC HELPER ---
-def get_bin_path(exe_name):
-    """Finds ffmpeg/ffprobe in a local 'bin' folder first, then system PATH."""
-    exe_with_ext = f"{exe_name}.exe" if os.name == 'nt' else exe_name
+def safe_print(message):
+    with print_lock:
+        print(message)
+
+def get_ffmpeg_args(mode):
+    """Returns the FFmpeg arguments based on speed mode, plus aggressive audio/meta removal."""
     
-    if getattr(sys, 'frozen', False):
-        base_dir = Path(sys.executable).parent
-    else:
-        base_dir = Path(__file__).parent
-        
-    local_bin = base_dir / "bin" / exe_with_ext
-    if local_bin.exists():
-        return str(local_bin)
-        
-    sys_path = shutil.which(exe_name)
-    if sys_path:
-        return sys_path
-        
-    raise FileNotFoundError(f"{exe_name} missing! Please place it in the 'bin/' or system PATH.")
-
-def detect_qsv_support():
-    """
-    Detects if Intel Quick Sync Video (QSV) hardware encoding actually works 
-    by attempting to encode a 0.1 second blank video in the background.
-    """
-    try:
-        cmd = [
-            get_bin_path("ffmpeg"),
-            "-v", "error",            
-            "-f", "lavfi",            
-            "-i", "color=c=black:s=256x256:d=0.1", 
-            "-c:v", "h264_qsv",       
-            "-f", "null",             
-            "-"                       
-        ]
-        
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
-        return result.returncode == 0
-    except Exception:
-        return False
-
-def default_worker_count(use_gpu):
-    if use_gpu:
-        return 1 
-    cores = os.cpu_count() or 4
-    return max(1, cores // 2)
-
-def find_mov_files(root_path):
-    """Recursively finds all .mov files, ensuring no duplicates on Windows."""
-    seen_paths = set()
-    unique_files = []
-    
-    # Search for both extensions but deduplicate by absolute path
-    for ext in ("*.mov", "*.MOV"):
-        for path_obj in Path(root_path).rglob(ext):
-            # Normalize path for Windows case-insensitivity
-            abs_path = str(path_obj.resolve()).lower()
-            if abs_path not in seen_paths:
-                seen_paths.add(abs_path)
-                unique_files.append(path_obj)
-                
-    return unique_files
-
-def verify_mp4(filepath):
-    return filepath.exists() and filepath.stat().st_size > 0
-
-def build_cmd(src, dst, use_gpu, threads_per_job):
-    cmd = [
-        get_bin_path("ffmpeg"),
-        "-y",                 
-        "-noautorotate",      
-        "-i", str(src),       
-        "-map_metadata", "-1", # Strips all global metadata
+    # THE METADATA NUKE:
+    # -an : removes all audio streams
+    # -map_metadata -1 : removes all global container metadata
+    # -map_metadata:s:v -1 : removes metadata specifically attached to the video stream (like handler names)
+    # -map_chapters -1 : removes any embedded chapters or scene markers
+    # -fflags +bitexact : prevents FFmpeg from writing its own "Lavf" software signature into the new file
+    # -movflags +faststart : optimizes MP4 structure for fast playback
+    # -y : overwrites existing files automatically
+    base_args = [
+        '-an', 
+        '-map_metadata', '-1', 
+        '-map_metadata:s:v', '-1',
+        '-map_chapters', '-1',
+        '-fflags', '+bitexact',
+        '-movflags', '+faststart', 
+        '-y'
     ]
     
-    if use_gpu:
-        cmd.extend(["-c:v", "h264_qsv", "-preset", "medium"])
+    if mode == 'copy':
+        # INSTANT: Copies only the video stream, no re-encoding.
+        return ['-c:v', 'copy'] + base_args
+    elif mode == 'nvidia':
+        return ['-c:v', 'h264_nvenc', '-preset', 'fast'] + base_args
+    elif mode == 'amd':
+        return ['-c:v', 'h264_amf'] + base_args
+    elif mode == 'intel':
+        return ['-c:v', 'h264_qsv'] + base_args
+    elif mode == 'cpu_ultrafast':
+        return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'] + base_args
     else:
-        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-        
-    cmd.extend([
-        "-an", # Completely removes the audio track (mutes the video)
-        "-threads", str(threads_per_job),
-        str(dst)
-    ])
-    
-    return cmd
+        return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23'] + base_args
 
-def convert_file(src, use_gpu, threads_per_job):
-    """Executes the FFmpeg conversion for a single file."""
-    dst = src.with_suffix('.mp4')
-    cmd = build_cmd(src, dst, use_gpu, threads_per_job)
-    cmd_str = " ".join(cmd)
+def process_single_video(file_path, in_dir, out_dir, default_mode):
+    relative_path = file_path.relative_to(in_dir)
+    target_path = out_dir / relative_path
+    target_path = target_path.with_suffix('.mp4')
+    
+    # Ensure target subfolder exists
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- SMART DETECTION ---
+    # If the file is already an MP4, force 'copy' mode to skip re-encoding.
+    # If it's a MOV, use whatever mode you selected at the bottom of the script.
+    current_mode = 'copy' if file_path.suffix.lower() == '.mp4' else default_mode
+
+    safe_print(f"Starting [{current_mode} | Deep-Scrub]: {relative_path.name}")
+    
+    # Construct command
+    command = ['ffmpeg', '-i', str(file_path)] + get_ffmpeg_args(current_mode) + [str(target_path)]
     
     try:
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        safe_print(f"  -> Finished: {relative_path.name}")
+    except subprocess.CalledProcessError:
+        safe_print(f"  -> ERROR: Failed to process {relative_path.name}.")
+    except FileNotFoundError:
+        safe_print("\nCRITICAL ERROR: 'ffmpeg' command not found.")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
-        
-        if result.returncode == 0 and verify_mp4(dst):
-            return (src, dst, True, "Successfully converted.")
-        else:
-            if dst.exists():
-                dst.unlink()
-            
-            err_msg = f"COMMAND RAN:\n{cmd_str}\n\nFFMPEG ERROR OUTPUT:\n{result.stderr.strip()}"
-            return (src, dst, False, err_msg)
-            
-    except Exception as e:
-        return (src, dst, False, f"Python Exception: {str(e)}")
+def process_videos_parallel(input_dir, output_dir, max_workers, mode):
+    in_dir = Path(input_dir)
+    out_dir = Path(output_dir)
 
+    if not in_dir.exists():
+        print(f"Error: Input directory '{input_dir}' not found.")
+        return
 
-# --- THREAD FOR BACKGROUND PROCESSING ---
-class ConversionWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool)
+    # Find both .mov and .mp4 files recursively
+    valid_extensions = {'.mov', '.mp4'}
+    video_files = [f for f in in_dir.rglob('*') if f.is_file() and f.suffix.lower() in valid_extensions]
+    
+    if not video_files:
+        print("No .mov or .mp4 files found in the input directory.")
+        return
 
-    def __init__(self, root_path):
-        super().__init__()
-        self.root_path = Path(root_path)
+    print(f"Found {len(video_files)} video files.")
+    print(f"Starting processing (Default Mode: {mode}, Workers: {max_workers})...\n")
 
-    def log(self, text):
-        self.log_signal.emit(text)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_video, file_path, in_dir, out_dir, mode) 
+            for file_path in video_files
+        ]
+        concurrent.futures.wait(futures)
 
-    def run(self):
-        try:
-            self.log("--- MOV to MP4 In-Place Converter ---")
-            
-            use_gpu = detect_qsv_support() 
-            self.log(f"Intel Quick Sync: {'Supported & Active' if use_gpu else 'Not Supported (Safely falling back to CPU)'}")
-
-            workers = default_worker_count(use_gpu)
-            cores = os.cpu_count() or 4
-            threads_per_job = max(1, cores // workers)
-
-            mov_files = find_mov_files(self.root_path)
-            if not mov_files:
-                self.log(f"No .mov files found under {self.root_path}")
-                self.finished_signal.emit(True)
-                return
-
-            self.log(f"Found {len(mov_files)} unique .mov file(s). Converting with {workers} worker(s)...\n")
-
-            results = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(convert_file, f, use_gpu, threads_per_job): f
-                    for f in mov_files
-                }
-                for future in as_completed(futures):
-                    src, dst, success, msg = future.result()
-                    
-                    if success:
-                        self.log(f"[OK] {src.name} :: {msg}")
-                        try:
-                            # Tiny delay to guarantee Windows releases the file handle fully
-                            time.sleep(0.1) 
-                            src.unlink()
-                            self.log(f"      Deleted original: {src.name}")
-                        except OSError as e:
-                            self.log(f"      Warning: could not delete {src.name}: {e}")
-                    else:
-                        self.log(f"\n[FAIL] {src.name}")
-                        self.log(msg + "\n")
-                    
-                    results.append((src, dst, success, msg))
-
-            succeeded = sum(1 for _, _, ok, _ in results if ok)
-            failed = len(results) - succeeded
-            self.log(f"\nDone. {succeeded} successful, {failed} failed.")
-            
-            self.finished_signal.emit(failed == 0)
-
-        except Exception as e:
-            self.log(f"\nCRITICAL ERROR: {str(e)}")
-            self.finished_signal.emit(False)
-
-
-# --- GUI WINDOW ---
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("MOV to MP4 Converter")
-        self.resize(800, 600)
-        self.setAcceptDrops(True) 
-
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
-
-        self.label = QLabel("Drag & Drop a folder below, or paste the path:")
-        layout.addWidget(self.label)
-
-        input_layout = QHBoxLayout()
-        self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("e.g. C:/Users/Name/Videos")
-        input_layout.addWidget(self.path_input)
-
-        self.browse_btn = QPushButton("Browse...")
-        self.browse_btn.clicked.connect(self.browse_folder)
-        input_layout.addWidget(self.browse_btn)
-        layout.addLayout(input_layout)
-
-        self.start_btn = QPushButton("Start Conversion")
-        self.start_btn.setMinimumHeight(40)
-        self.start_btn.clicked.connect(self.start_conversion)
-        layout.addWidget(self.start_btn)
-
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
-        layout.addWidget(self.log_output)
-
-        self.worker = None
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            url = event.mimeData().urls()[0]
-            if Path(url.toLocalFile()).is_dir():
-                event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        url = event.mimeData().urls()[0]
-        self.path_input.setText(url.toLocalFile())
-
-    def browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if folder:
-            self.path_input.setText(folder)
-
-    def start_conversion(self):
-        folder_path = self.path_input.text().strip()
-        if not folder_path or not Path(folder_path).is_dir():
-            self.log_output.append("Error: Please provide a valid directory path.")
-            return
-
-        self.start_btn.setEnabled(False)
-        self.browse_btn.setEnabled(False)
-        self.path_input.setEnabled(False)
-        self.log_output.clear()
-
-        self.worker = ConversionWorker(folder_path)
-        self.worker.log_signal.connect(self.append_log)
-        self.worker.finished_signal.connect(self.conversion_finished)
-        self.worker.start()
-
-    def append_log(self, text):
-        self.log_output.append(text)
-        scrollbar = self.log_output.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def conversion_finished(self, success):
-        self.start_btn.setEnabled(True)
-        self.browse_btn.setEnabled(True)
-        self.path_input.setEnabled(True)
-        self.worker = None
+    print("\nAll processing complete! Videos are now clean MP4s, deeply scrubbed of metadata, with no audio.")
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    # --- SETUP YOUR PATHS HERE ---
+    INPUT_FOLDER = input("Enter the input folder path: ").strip('"\'')
+    OUTPUT_FOLDER = input("Enter the output folder path: ").strip('"\'')
+    
+    # --- CHOOSE YOUR SPEED MODE HERE ---
+    ENCODING_MODE = 'cpu_ultrafast' 
+    MAX_WORKERS = 4 
+    
+    process_videos_parallel(INPUT_FOLDER, OUTPUT_FOLDER, MAX_WORKERS, ENCODING_MODE)
